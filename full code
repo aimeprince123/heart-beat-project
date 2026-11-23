@@ -1,0 +1,188 @@
+
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include <HardwareSerial.h>
+
+const char* ssid = "YOUR_WIFI_NAME";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+const char* serverURL =
+"http://192.168.1.10/school_form_fixed_files/api_receive.php";
+
+const char* apiKey = "MY_SECRET_123";
+const char* emergencyNumber = "+250780986245";
+
+HardwareSerial gsm(2);
+MAX30105 particleSensor;
+
+const int GSM_RX = 16;
+const int GSM_TX = 17;
+
+const int LOW_BPM = 40;
+const int RESET_BPM = 45;
+
+int lowCount = 0;
+bool alertSent = false;
+
+long lastBeat = 0;
+int beatAvg = 0;
+
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE] = {0};
+byte rateSpot = 0;
+byte rateCount = 0;
+
+unsigned long lastUpload = 0;
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.println("Connecting WiFi...");
+  }
+
+  Serial.println("WiFi Connected!");
+
+  gsm.begin(9600, SERIAL_8N1, GSM_RX, GSM_TX);
+  delay(2000);
+
+  gsm.println("AT");
+  delay(1000);
+  gsm.println("AT+CMGF=1");
+  delay(1000);
+
+  if (!particleSensor.begin(Wire, I2C_SPEED_STANDARD)) {
+    Serial.println("MAX30102 not found!");
+    while (1) delay(1000);
+  }
+
+  particleSensor.setup();
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeIR(0x1F);
+
+  Serial.println("Heartbeat system ready!");
+}
+
+void sendSMS(String message) {
+  gsm.println("AT+CMGF=1");
+  delay(500);
+
+  gsm.print("AT+CMGS=\"");
+  gsm.print(emergencyNumber);
+  gsm.println("\"");
+
+  delay(1000);
+  gsm.print(message);
+  delay(500);
+  gsm.write(26);
+  delay(5000);
+}
+
+void makeCall() {
+  Serial.println("Calling 0780986245...");
+
+  gsm.print("ATD");
+  gsm.print(emergencyNumber);
+  gsm.println(";");
+
+  delay(20000);
+
+  gsm.println("ATH");
+  delay(1000);
+}
+
+void checkHeartbeat(int bpm) {
+  if (bpm > 0 && bpm <= LOW_BPM) {
+    lowCount++;
+
+    if (lowCount >= 3 && !alertSent) {
+      alertSent = true;
+
+      sendSMS("ALERT! Heartbeat is 40 BPM or below. Please check immediately.");
+
+      makeCall();
+    }
+  }
+  else if (bpm > RESET_BPM) {
+    lowCount = 0;
+    alertSent = false;
+  }
+  else {
+    lowCount = 0;
+  }
+}
+
+void sendToDashboard(int bpm) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  HTTPClient http;
+
+  http.begin(serverURL);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", apiKey);
+
+  String json = "{\"bpm\":" + String(bpm) + "}";
+
+  int response = http.POST(json);
+
+  Serial.print("Server response: ");
+  Serial.println(response);
+
+  http.end();
+}
+
+void loop() {
+  long irValue = particleSensor.getIR();
+
+  if (irValue < 50000) {
+    Serial.println("Place finger on sensor");
+    lowCount = 0;
+    delay(250);
+    return;
+  }
+
+  if (checkForBeat(irValue)) {
+    long now = millis();
+    long delta = now - lastBeat;
+    lastBeat = now;
+
+    if (delta > 0) {
+      float bpm = 60.0 / (delta / 1000.0);
+
+      if (bpm >= 30 && bpm <= 220) {
+        rates[rateSpot] = (byte)bpm;
+        rateSpot = (rateSpot + 1) % RATE_SIZE;
+
+        if (rateCount < RATE_SIZE) rateCount++;
+
+        int total = 0;
+        for (byte i = 0; i < rateCount; i++) {
+          total += rates[i];
+        }
+
+        beatAvg = total / rateCount;
+
+        Serial.print("Heartbeat: ");
+        Serial.print(beatAvg);
+        Serial.println(" BPM");
+
+        checkHeartbeat(beatAvg);
+
+        if (millis() - lastUpload >= 5000) {
+          sendToDashboard(beatAvg);
+          lastUpload = millis();
+        }
+      }
+    }
+  }
+
+  delay(20);
+}
